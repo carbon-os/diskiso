@@ -1,15 +1,3 @@
-// cmd/diskiso/main.go
-//
-// Usage:
-//
-//	diskiso <image.iso> --info
-//	diskiso <image.iso> --fs <command> [args] [--layer udf|joliet|rockridge|iso9660]
-//
-// Commands:
-//
-//	ls  <path>        list directory contents (default: /)
-//	cat <path>        stream file to stdout
-//	get <src> <dst>   extract a file from the ISO to the host filesystem
 package main
 
 import (
@@ -24,6 +12,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/carbon-os/diskiso"
+	"github.com/carbon-os/diskiso/udf"
 )
 
 func main() {
@@ -35,7 +24,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: diskiso <image.iso> --info | --fs <cmd> [args] [--layer <fs>]")
+		return errors.New("usage: diskiso <image.iso> --info | --diagnose | --fs <cmd> [args] [--layer <fs>]")
 	}
 
 	isoPath := args[0]
@@ -43,9 +32,10 @@ func run(args []string) error {
 
 	fset := flag.NewFlagSet("diskiso", flag.ContinueOnError)
 	var (
-		info  = fset.Bool("info", false, "print detected layers and root listing")
-		fscmd = fset.Bool("fs",   false, "run a filesystem command: ls, cat, get")
-		layer = fset.String("layer", "", "layer to mount: udf, joliet, rockridge, iso9660")
+		info     = fset.Bool("info",     false, "print detected layers and root listing")
+		diagnose = fset.Bool("diagnose", false, "dump raw UDF chain for debugging")
+		fscmd    = fset.Bool("fs",       false, "run a filesystem command: ls, cat, get")
+		layer    = fset.String("layer",  "",    "layer to mount: udf, joliet, rockridge, iso9660")
 	)
 	if err := fset.Parse(rest); err != nil {
 		return err
@@ -54,10 +44,12 @@ func run(args []string) error {
 	switch {
 	case *info:
 		return runInfo(isoPath)
+	case *diagnose:
+		return udf.Diagnose(isoPath)
 	case *fscmd:
 		return runFS(isoPath, *layer, fset.Args())
 	default:
-		return errors.New("one of --info or --fs is required")
+		return errors.New("one of --info, --diagnose, or --fs is required")
 	}
 }
 
@@ -91,16 +83,35 @@ func runInfo(isoPath string) error {
 		fmt.Fprintf(tw, "%s\t%s\n", layer, vol.Label())
 	}
 	tw.Flush()
-
-	// Root listing using the best available layer.
 	fmt.Println()
-	vol, err := disc.Mount()
-	if err != nil {
-		return err
+
+	// Mount best available layer and list root. If the best layer returns an
+	// empty root (common with malformed UDF on Windows ISOs), fall back through
+	// the remaining layers until we find one with entries.
+	var (
+		vol     diskiso.Volume
+		entries []fs.DirEntry
+	)
+	for _, layer := range disc.Filesystems() {
+		v, err := disc.Mount(layer)
+		if err != nil {
+			continue
+		}
+		e, err := v.ReadDir("/")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  [%s] ReadDir error: %v\n", v.Type(), err)
+			continue
+		}
+		if len(e) > 0 {
+			vol     = v
+			entries = e
+			break
+		}
+		fmt.Fprintf(os.Stderr, "  [%s] root is empty, trying next layer\n", v.Type())
 	}
-	entries, err := vol.ReadDir("/")
-	if err != nil {
-		return err
+
+	if vol == nil {
+		return errors.New("no layer returned a non-empty root directory")
 	}
 
 	fmt.Printf("Root directory (%s):\n", vol.Type())
@@ -112,8 +123,7 @@ func runInfo(isoPath string) error {
 			suffix = "/"
 		}
 		fmt.Fprintf(tw, "  %s%s\t%s\t%s\n",
-			e.Name(),
-			suffix,
+			e.Name(), suffix,
 			formatBytes(info.Size()),
 			info.ModTime().Format("2006-01-02 15:04"),
 		)
@@ -135,18 +145,33 @@ func runFS(isoPath, layerName string, args []string) error {
 	}
 	defer disc.Detach()
 
-	var mountArgs []diskiso.Filesystem
+	// If a specific layer is requested, use it.
+	// Otherwise try each layer in priority order until one gives a non-empty root.
+	var vol diskiso.Volume
 	if layerName != "" {
 		layer, err := parseLayer(layerName)
 		if err != nil {
 			return err
 		}
-		mountArgs = append(mountArgs, layer)
-	}
-
-	vol, err := disc.Mount(mountArgs...)
-	if err != nil {
-		return err
+		vol, err = disc.Mount(layer)
+		if err != nil {
+			return err
+		}
+	} else {
+		for _, layer := range disc.Filesystems() {
+			v, err := disc.Mount(layer)
+			if err != nil {
+				continue
+			}
+			e, err := v.ReadDir("/")
+			if err == nil && len(e) > 0 {
+				vol = v
+				break
+			}
+		}
+		if vol == nil {
+			return errors.New("no layer returned a non-empty root directory")
+		}
 	}
 
 	cmd  := args[0]
@@ -166,18 +191,15 @@ func runFS(isoPath, layerName string, args []string) error {
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
-// ls [path]
 func cmdLS(vol diskiso.Volume, args []string) error {
 	dir := "/"
 	if len(args) > 0 {
 		dir = args[0]
 	}
-
 	entries, err := vol.ReadDir(dir)
 	if err != nil {
 		return err
 	}
-
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	for _, e := range entries {
 		info, _ := e.Info()
@@ -186,9 +208,7 @@ func cmdLS(vol diskiso.Volume, args []string) error {
 			suffix = "/"
 		}
 		fmt.Fprintf(tw, "%s\t%s%s\t%s\t%s\n",
-			info.Mode(),
-			e.Name(),
-			suffix,
+			info.Mode(), e.Name(), suffix,
 			formatBytes(info.Size()),
 			info.ModTime().Format("2006-01-02 15:04"),
 		)
@@ -196,7 +216,6 @@ func cmdLS(vol diskiso.Volume, args []string) error {
 	return tw.Flush()
 }
 
-// cat <path>
 func cmdCat(vol diskiso.Volume, args []string) error {
 	if len(args) == 0 {
 		return errors.New("cat: requires a path argument")
@@ -210,31 +229,24 @@ func cmdCat(vol diskiso.Volume, args []string) error {
 	return err
 }
 
-// get <iso-src> <host-dst>
 func cmdGet(vol diskiso.Volume, args []string) error {
 	if len(args) < 2 {
 		return errors.New("get: requires <src> and <dst> arguments")
 	}
 	src, dst := args[0], args[1]
-
-	// If dst is an existing directory, preserve the source filename.
 	if fi, err := os.Stat(dst); err == nil && fi.IsDir() {
 		dst = filepath.Join(dst, filepath.Base(src))
 	}
-
-	// Stream directly to disk rather than reading the whole file into memory.
 	f, err := vol.Open(src)
 	if err != nil {
 		return fmt.Errorf("get: open %s: %w", src, err)
 	}
 	defer f.Close()
-
 	out, err := os.Create(dst)
 	if err != nil {
 		return fmt.Errorf("get: create %s: %w", dst, err)
 	}
 	defer out.Close()
-
 	n, err := io.Copy(out, f.(io.Reader))
 	if err != nil {
 		return fmt.Errorf("get: copy: %w", err)
@@ -245,7 +257,6 @@ func cmdGet(vol diskiso.Volume, args []string) error {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// ensure fs.DirEntry is imported (used by ReadDir return type)
 var _ fs.DirEntry
 
 func parseLayer(name string) (diskiso.Filesystem, error) {

@@ -18,12 +18,13 @@ import (
 
 // Volume implements diskiso.Volume for UDF (ECMA-167 / OSTA UDF 1.x–2.x).
 type Volume struct {
-	sr         *region.SectorReader
-	partStart  uint32
-	partLen    uint32
-	rootICBLBA uint32
-	label      string
-	size       int64
+	sr          *region.SectorReader
+	partStart   uint32
+	partLen     uint32
+	rootICBLBA  uint32
+	label       string
+	size        int64
+	efeFECompat bool // EFEs on this volume use FE-compatible body (no objectSize)
 }
 
 func NewVolume(r io.ReaderAt) (*Volume, error) {
@@ -60,14 +61,13 @@ func (v *Volume) parseVDS(startLBA, length uint32) error {
 			return err
 		}
 		tagID := binary.LittleEndian.Uint16(sec[0:2])
-
 		switch tagID {
 		case 5:
 			partStart = binary.LittleEndian.Uint32(sec[188:192])
 			partLen   = binary.LittleEndian.Uint32(sec[192:196])
 			partFound = true
 		case 6:
-			fsdLBA  = binary.LittleEndian.Uint32(sec[252:256])
+			fsdLBA   = binary.LittleEndian.Uint32(sec[252:256])
 			fsdFound = true
 		case 8:
 			goto done
@@ -77,11 +77,9 @@ done:
 	if !partFound || !fsdFound {
 		return errors.New("udf: missing Partition or Logical Volume Descriptor")
 	}
-
 	v.partStart = partStart
 	v.partLen   = partLen
 	v.size      = int64(partStart+partLen) * region.SectorSize
-
 	return v.parseFSD(v.partStart + fsdLBA)
 }
 
@@ -94,15 +92,112 @@ func (v *Volume) parseFSD(lba uint32) error {
 	if tagID != 256 {
 		return fmt.Errorf("udf: expected FSD (tag 256) at sector %d, got %d", lba, tagID)
 	}
-
 	v.rootICBLBA = v.partStart + binary.LittleEndian.Uint32(sec[404:408])
-
 	field  := sec[112:240]
 	strLen := int(field[127])
 	if strLen > 0 && strLen <= 127 {
 		v.label = decodeCS0(field[:strLen])
 	}
+	// Detect EFE body style from the root file entry before any other parsing.
+	v.probeEFELayout()
 	return nil
+}
+
+// probeEFELayout reads the root file entry once at volume-open time and
+// determines whether Extended File Entries (tag 261) on this volume use the
+// standard ECMA-167 body layout (objectSize at BP 64, eaLen@208) or the
+// FE-compatible layout (no objectSize, eaLen@168).
+//
+// Some UDF generators emit tag=261 descriptors whose body is identical to a
+// tag=260 File Entry — i.e. no objectSize, no streamDirectoryICB.  The two
+// variants cannot be distinguished reliably on a per-entry basis when the AD
+// area happens to contain non-zero bytes at the standard EFE offset, so we
+// detect the style once and apply it uniformly across the whole volume.
+//
+// Detection uses the root directory entry because it is always present and
+// always a non-empty file (infoLen > 0), which lets us validate the candidate
+// AD layout by checking that the first allocation descriptor's partition-
+// relative LBA falls within the partition.
+func (v *Volume) probeEFELayout() {
+	sec, err := v.sr.ReadSector(v.rootICBLBA)
+	if err != nil {
+		return
+	}
+	tagID := binary.LittleEndian.Uint16(sec[0:2])
+	if tagID != 261 {
+		// Root is a regular FE; standard EFE offsets are assumed correct.
+		return
+	}
+
+	icbFlags  := binary.LittleEndian.Uint16(sec[34:36])
+	allocType := uint32(icbFlags & 0x0007)
+
+	// Try the standard EFE layout (eaLen@208).
+	efeEALen   := binary.LittleEndian.Uint32(sec[208:212])
+	efeADLen   := binary.LittleEndian.Uint32(sec[212:216])
+	efeADStart := 216 + int(efeEALen)
+
+	if v.adRangeValid(sec, efeADStart, efeADLen, allocType) {
+		// Standard layout is consistent — use it.
+		v.efeFECompat = false
+		return
+	}
+
+	// Standard layout failed — this volume uses FE-compatible EFE bodies.
+	v.efeFECompat = true
+}
+
+// adRangeValid returns true when adStart/adLen fit in the sector AND the first
+// allocation descriptor's partition-relative LBA is within the partition.
+// Checking the LBA bound is far more discriminating than checking extLen alone,
+// because an incorrect offset position will typically produce a byte sequence
+// whose lower 32 bits, interpreted as a partition-relative LBA, exceed partLen.
+func (v *Volume) adRangeValid(sec []byte, adStart int, adLen uint32, allocType uint32) bool {
+	if adStart < 0 || adLen == 0 || adStart+int(adLen) > len(sec) {
+		return false
+	}
+	// Minimum AD sizes: Short=8, Long=16, Extended=20
+	minSize := 8
+	posOff  := 4 // byte offset of LBA within the AD
+	switch allocType {
+	case 1:
+		minSize = 16
+	case 2:
+		minSize = 20
+		posOff  = 12
+	case 3:
+		return true // inline — no LBA to check
+	}
+	if adStart+posOff+4 > len(sec) {
+		return false
+	}
+	extLen := binary.LittleEndian.Uint32(sec[adStart:adStart+4]) & 0x3FFFFFFF
+	if extLen == 0 {
+		return false
+	}
+	extPos := binary.LittleEndian.Uint32(sec[adStart+posOff : adStart+posOff+4])
+	_ = minSize
+	return extPos < v.partLen
+}
+
+// resolveADLayout returns the adLen, adStart, and modificationTime byte offset
+// for this file entry sector, using the EFE body style detected at volume open.
+//
+//	tag 260 (FE) or FE-compatible EFE: eaLen@168  adLen@172  adBase=176  modTime@84
+//	tag 261 standard EFE:              eaLen@208  adLen@212  adBase=216  modTime@92
+func (v *Volume) resolveADLayout(sec []byte, tagID uint16) (adLen uint32, adStart, modOff int) {
+	if tagID == 261 && !v.efeFECompat {
+		eaLen   := binary.LittleEndian.Uint32(sec[208:212])
+		adLen    = binary.LittleEndian.Uint32(sec[212:216])
+		adStart  = 216 + int(eaLen)
+		modOff   = 92
+	} else {
+		eaLen   := binary.LittleEndian.Uint32(sec[168:172])
+		adLen    = binary.LittleEndian.Uint32(sec[172:176])
+		adStart  = 176 + int(eaLen)
+		modOff   = 84
+	}
+	return
 }
 
 // --- diskiso.Volume interface ---
@@ -121,7 +216,6 @@ func (v *Volume) ReadFile(filePath string) ([]byte, error) {
 	if fe.inlineData != nil {
 		return fe.inlineData, nil
 	}
-
 	buf := make([]byte, fe.totalLen)
 	var offset uint64
 	for _, ext := range fe.extents {
@@ -196,77 +290,6 @@ type fileEntry struct {
 	inlineData []byte
 }
 
-// resolveADLayout returns the eaLen, adLen, adStart, and modificationTime byte
-// offset appropriate for this file entry sector.
-//
-// Tag 260 (File Entry) has fixed offsets per ECMA-167:
-//   eaLen@168  adLen@172  adBase=176  modTime@84
-//
-// Tag 261 (Extended File Entry) adds objectSize (8 bytes) at BP 64, which
-// shifts eaLen to BP 208 and modTime to BP 92.  However, some UDF generators
-// emit tag=261 descriptors whose body is byte-for-byte identical to a tag=260
-// FE — no objectSize, no streamDirectoryICB — so eaLen is still at BP 168.
-//
-// We distinguish the two EFE variants by validating the allocation descriptors
-// at the candidate adStart: if the first AD carries a zero extent length for a
-// non-empty file, the standard EFE offsets are wrong and we fall back to the
-// FE-compatible offsets.
-func resolveADLayout(sec []byte, tagID uint16, infoLen uint64, allocType uint32) (adLen uint32, adStart, modOff int) {
-	if tagID != 261 {
-		eaLen   := binary.LittleEndian.Uint32(sec[168:172])
-		adLen    = binary.LittleEndian.Uint32(sec[172:176])
-		adStart  = 176 + int(eaLen)
-		modOff   = 84
-		return
-	}
-
-	efeEALen   := binary.LittleEndian.Uint32(sec[208:212])
-	efeADLen   := binary.LittleEndian.Uint32(sec[212:216])
-	efeADStart := 216 + int(efeEALen)
-
-	if adLayoutValid(sec, efeADStart, efeADLen, allocType, infoLen) {
-		adLen   = efeADLen
-		adStart = efeADStart
-		modOff  = 92
-		return
-	}
-
-	feEALen  := binary.LittleEndian.Uint32(sec[168:172])
-	adLen     = binary.LittleEndian.Uint32(sec[172:176])
-	adStart   = 176 + int(feEALen)
-	modOff    = 84
-	return
-}
-
-// adLayoutValid reports whether adStart/adLen look like a consistent
-// allocation-descriptor region for a file with the given infoLen.
-//
-//   - The AD region must fit entirely within the sector.
-//   - Inline data (allocType 3): adLen must equal infoLen exactly.
-//   - Empty file: any layout is trivially valid.
-//   - Non-empty non-inline: adLen must be non-zero and the first AD must
-//     carry a non-zero extent length (top 2 bits are the type, bottom 30
-//     are the length).
-func adLayoutValid(sec []byte, adStart int, adLen uint32, allocType uint32, infoLen uint64) bool {
-	if adStart < 0 || adStart+int(adLen) > len(sec) {
-		return false
-	}
-	if allocType == 3 {
-		return uint64(adLen) == infoLen
-	}
-	if infoLen == 0 {
-		return true
-	}
-	if adLen == 0 {
-		return false
-	}
-	if adStart+4 > len(sec) {
-		return false
-	}
-	extLen := binary.LittleEndian.Uint32(sec[adStart:adStart+4]) & 0x3FFFFFFF
-	return extLen > 0
-}
-
 func (v *Volume) parseFileEntry(lba uint32) (*fileEntry, error) {
 	sec, err := v.sr.ReadSector(lba)
 	if err != nil {
@@ -277,7 +300,6 @@ func (v *Volume) parseFileEntry(lba uint32) (*fileEntry, error) {
 		return nil, fmt.Errorf("udf: expected File Entry at sector %d (tag 260/261), got %d", lba, tagID)
 	}
 
-	// ICB Tag fields — same position in both FE and EFE.
 	icbFileType := sec[27]
 	isDir       := icbFileType == 4
 	infoLen     := binary.LittleEndian.Uint64(sec[56:64])
@@ -286,7 +308,7 @@ func (v *Volume) parseFileEntry(lba uint32) (*fileEntry, error) {
 	posixPerm   := binary.LittleEndian.Uint32(sec[44:48])
 	mode        := udfPermToFileMode(posixPerm, isDir)
 
-	adLen, adStart, modOff := resolveADLayout(sec, tagID, infoLen, allocType)
+	adLen, adStart, modOff := v.resolveADLayout(sec, tagID)
 	modTime := parseUDFTimestamp(sec[modOff : modOff+12])
 
 	fe := &fileEntry{
@@ -298,7 +320,6 @@ func (v *Volume) parseFileEntry(lba uint32) (*fileEntry, error) {
 	}
 
 	if allocType == 3 {
-		// Inline data — stored directly in the allocation-descriptor area.
 		if adLen > 0 && adStart+int(adLen) <= len(sec) {
 			fe.inlineData = make([]byte, adLen)
 			copy(fe.inlineData, sec[adStart:adStart+int(adLen)])
@@ -314,30 +335,27 @@ func (v *Volume) parseFileEntry(lba uint32) (*fileEntry, error) {
 			var step int
 
 			switch allocType {
-			case 0: // Short AD: extLength(4) + extPosition(4)
+			case 0: // Short AD
 				if offset+8 > len(adData) {
 					return nil
 				}
 				extLen = binary.LittleEndian.Uint32(adData[offset : offset+4])
 				extPos = binary.LittleEndian.Uint32(adData[offset+4 : offset+8])
 				step = 8
-
-			case 1: // Long AD: extLength(4) + lb_addr{ LBN(4) + partRef(2) }(6) + impUse(6)
+			case 1: // Long AD
 				if offset+16 > len(adData) {
 					return nil
 				}
 				extLen = binary.LittleEndian.Uint32(adData[offset : offset+4])
 				extPos = binary.LittleEndian.Uint32(adData[offset+4 : offset+8])
 				step = 16
-
-			case 2: // Extended AD: extLength(4) + recordedLen(4) + infoLen(4) + lb_addr(6) + impUse(2)
+			case 2: // Extended AD
 				if offset+20 > len(adData) {
 					return nil
 				}
 				extLen = binary.LittleEndian.Uint32(adData[offset : offset+4])
 				extPos = binary.LittleEndian.Uint32(adData[offset+12 : offset+16])
 				step = 20
-
 			default:
 				return fmt.Errorf("udf: unsupported allocType %d", allocType)
 			}
@@ -349,11 +367,8 @@ func (v *Volume) parseFileEntry(lba uint32) (*fileEntry, error) {
 			if eLen == 0 {
 				continue
 			}
-
 			switch eType {
-			case 3:
-				// Allocation Extent Descriptor (tag 328) — continuation sector.
-				// ECMA-167 4/14.5: tag(16) + prevAllocExtLoc(4) + lengthOfADs(4) + ADs…
+			case 3: // Allocation Extent Descriptor — continuation
 				adSecs, err := v.sr.ReadSectors(v.partStart+extPos, (eLen+2047)/2048)
 				if err != nil {
 					return err
@@ -366,13 +381,11 @@ func (v *Volume) parseFileEntry(lba uint32) (*fileEntry, error) {
 						}
 					}
 				}
-
 			case 0, 1:
 				fe.extents = append(fe.extents, extent{
 					lba: v.partStart + extPos,
 					len: eLen,
 				})
-				// eType 2 (allocated, not recorded) — skip.
 			}
 		}
 		return nil
@@ -479,7 +492,6 @@ func (v *Volume) readDirEntries(fe *fileEntry) ([]*fileEntry, error) {
 		if tagID != 257 {
 			break
 		}
-
 		fileChars := data[offset+18]
 		lfi       := int(data[offset+19])
 		icbLBA    := binary.LittleEndian.Uint32(data[offset+24 : offset+28])
@@ -510,7 +522,6 @@ func (v *Volume) readDirEntries(fe *fileEntry) ([]*fileEntry, error) {
 				entries = append(entries, child)
 			}
 		}
-
 		offset += totalLen
 	}
 	return entries, nil
@@ -607,9 +618,9 @@ type udfFile struct {
 	path string
 }
 
-func (f *udfFile) Read(b []byte) (int, error)  { return f.r.Read(b) }
-func (f *udfFile) Close() error                { return nil }
-func (f *udfFile) Stat() (fs.FileInfo, error)  { return f.fe.toFileInfo(), nil }
+func (f *udfFile) Read(b []byte) (int, error) { return f.r.Read(b) }
+func (f *udfFile) Close() error               { return nil }
+func (f *udfFile) Stat() (fs.FileInfo, error) { return f.fe.toFileInfo(), nil }
 
 func (f *udfFile) ReadDir(n int) ([]fs.DirEntry, error) {
 	if !f.fe.isDir {
@@ -630,8 +641,8 @@ func (f *udfFile) ReadDir(n int) ([]fs.DirEntry, error) {
 }
 
 // ReadAt implements io.ReaderAt by mapping logical byte offsets across UDF
-// extents, allowing random-access readers (e.g. the WIM parser) to work
-// directly against the ISO without spooling to a temporary file.
+// extents, letting random-access readers (e.g. the WIM parser) work directly
+// against the ISO without spooling to a temporary file.
 func (f *udfFile) ReadAt(p []byte, off int64) (int, error) {
 	if off < 0 {
 		return 0, fmt.Errorf("udf: ReadAt: negative offset")
@@ -639,8 +650,6 @@ func (f *udfFile) ReadAt(p []byte, off int64) (int, error) {
 	if off >= int64(f.fe.totalLen) {
 		return 0, io.EOF
 	}
-
-	// Clamp read to file boundary.
 	if int64(len(p)) > int64(f.fe.totalLen)-off {
 		p = p[:int64(f.fe.totalLen)-off]
 	}

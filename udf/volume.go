@@ -196,6 +196,26 @@ type fileEntry struct {
 	inlineData []byte
 }
 
+// parseFileEntry reads and decodes the File Entry or Extended File Entry at the
+// given absolute sector LBA.
+//
+// ECMA-167 3rd edition defines two ICB file-entry descriptors:
+//
+//	tag 260 — File Entry (FE)
+//	  BP 168  lengthExtendedAttr  (4)
+//	  BP 172  lengthAllocDescs    (4)
+//	  BP 176  allocationDescriptors…
+//
+//	tag 261 — Extended File Entry (EFE)
+//	  Adds objectSize (8), createTime (12), reserved (4), and
+//	  streamDirectoryICB (16) relative to the FE layout, pushing the
+//	  allocation-descriptor fields to:
+//	  BP 208  lengthExtendedAttr  (4)
+//	  BP 212  lengthAllocDescs    (4)
+//	  BP 216  allocationDescriptors…
+//
+// modificationTime is at BP 84 for FE and BP 92 for EFE (objectSize shifts
+// logicalBlocksRecorded and the timestamp chain by 8 bytes).
 func (v *Volume) parseFileEntry(lba uint32) (*fileEntry, error) {
 	sec, err := v.sr.ReadSector(lba)
 	if err != nil {
@@ -206,15 +226,29 @@ func (v *Volume) parseFileEntry(lba uint32) (*fileEntry, error) {
 		return nil, fmt.Errorf("udf: expected File Entry at sector %d (tag 260/261), got %d", lba, tagID)
 	}
 
+	// ICB Tag fields — same position in both FE and EFE.
 	icbFileType := sec[27]
-	isDir := icbFileType == 4
-	infoLen := binary.LittleEndian.Uint64(sec[56:64])
-	modTime := parseUDFTimestamp(sec[84:96])
-	posixPerm := binary.LittleEndian.Uint32(sec[44:48])
-	mode := udfPermToFileMode(posixPerm, isDir)
-	icbFlags := binary.LittleEndian.Uint16(sec[34:36])
-	allocType := icbFlags & 0x0007
+	isDir       := icbFileType == 4
+	infoLen     := binary.LittleEndian.Uint64(sec[56:64])
+	icbFlags    := binary.LittleEndian.Uint16(sec[34:36])
+	allocType   := icbFlags & 0x0007
+	posixPerm   := binary.LittleEndian.Uint32(sec[44:48])
+	mode        := udfPermToFileMode(posixPerm, isDir)
 
+	// modificationTime — BP 84 for FE, BP 92 for EFE.
+	// EFE inserts an 8-byte objectSize field at BP 64, shifting every
+	// subsequent timestamp by 8 bytes.
+	var modOff int
+	if tagID == 261 {
+		modOff = 92
+	} else {
+		modOff = 84
+	}
+	modTime := parseUDFTimestamp(sec[modOff : modOff+12])
+
+	// Allocation-descriptor field offsets.
+	// FE:  eaLen@168  adLen@172  adBase=176
+	// EFE: eaLen@208  adLen@212  adBase=216
 	var eaLenOff, adLenOff, adBase int
 	if tagID == 261 {
 		eaLenOff, adLenOff, adBase = 208, 212, 216
@@ -222,33 +256,9 @@ func (v *Volume) parseFileEntry(lba uint32) (*fileEntry, error) {
 		eaLenOff, adLenOff, adBase = 168, 172, 176
 	}
 
-	eaLen := binary.LittleEndian.Uint32(sec[eaLenOff : eaLenOff+4])
-	adLen := binary.LittleEndian.Uint32(sec[adLenOff : adLenOff+4])
+	eaLen   := binary.LittleEndian.Uint32(sec[eaLenOff : eaLenOff+4])
+	adLen   := binary.LittleEndian.Uint32(sec[adLenOff : adLenOff+4])
 	adStart := adBase + int(eaLen)
-
-	if tagID == 261 {
-		feEaLen := binary.LittleEndian.Uint32(sec[168:172])
-		feAdLen := binary.LittleEndian.Uint32(sec[172:176])
-		feAdStart := 176 + int(feEaLen)
-
-		if allocType == 3 {
-			if adLen != uint32(infoLen) && feAdLen == uint32(infoLen) {
-				adStart, adLen = feAdStart, feAdLen
-			}
-		} else {
-			efeExtLen := uint32(0)
-			if adStart+4 <= len(sec) {
-				efeExtLen = binary.LittleEndian.Uint32(sec[adStart:adStart+4]) & 0x3FFFFFFF
-			}
-			feExtLen := uint32(0)
-			if feAdStart+4 <= len(sec) {
-				feExtLen = binary.LittleEndian.Uint32(sec[feAdStart:feAdStart+4]) & 0x3FFFFFFF
-			}
-			if efeExtLen == 0 && feExtLen > 0 {
-				adStart, adLen = feAdStart, feAdLen
-			}
-		}
-	}
 
 	fe := &fileEntry{
 		isDir:    isDir,
@@ -259,6 +269,7 @@ func (v *Volume) parseFileEntry(lba uint32) (*fileEntry, error) {
 	}
 
 	if allocType == 3 {
+		// Inline data stored directly in the allocation-descriptor area.
 		if adLen > 0 && adStart+int(adLen) <= len(sec) {
 			fe.inlineData = make([]byte, adLen)
 			copy(fe.inlineData, sec[adStart:adStart+int(adLen)])
@@ -271,46 +282,54 @@ func (v *Volume) parseFileEntry(lba uint32) (*fileEntry, error) {
 				var extLen, extPos uint32
 				var step int
 
-				if allocType == 0 {
+				switch allocType {
+				case 0: // Short AD: extLength(4) + extPosition(4)
 					if offset+8 > len(adData) {
-						break
+						return nil
 					}
 					extLen = binary.LittleEndian.Uint32(adData[offset : offset+4])
 					extPos = binary.LittleEndian.Uint32(adData[offset+4 : offset+8])
 					step = 8
-				} else if allocType == 1 {
+
+				case 1: // Long AD: extLength(4) + lb_addr{ logicalBlockNum(4) + partRef(2) }(6) + impUse(6)
 					if offset+16 > len(adData) {
-						break
+						return nil
 					}
 					extLen = binary.LittleEndian.Uint32(adData[offset : offset+4])
 					extPos = binary.LittleEndian.Uint32(adData[offset+4 : offset+8])
+					// partitionReferenceNum at [offset+8:offset+10] — ignored (single-partition)
 					step = 16
-				} else if allocType == 2 {
+
+				case 2: // Extended AD: extLength(4) + recordedLength(4) + infoLength(4) + lb_addr(6) + impUse(2)
 					if offset+20 > len(adData) {
-						break
+						return nil
 					}
 					extLen = binary.LittleEndian.Uint32(adData[offset : offset+4])
 					extPos = binary.LittleEndian.Uint32(adData[offset+12 : offset+16])
 					step = 20
-				} else {
+
+				default:
 					return fmt.Errorf("udf: unsupported allocType %d", allocType)
 				}
 
 				eType := extLen >> 30
-				eLen := extLen & 0x3FFFFFFF
+				eLen  := extLen & 0x3FFFFFFF
 				offset += step
 
 				if eLen == 0 {
 					continue
 				}
 
-				if eType == 3 {
+				switch eType {
+				case 3:
+					// Allocation Extent Descriptor — continuation sector.
+					// ECMA-167 4/14.5: tag(16) + prevAllocExtLoc(4) + lengthOfADs(4) + ADs…
 					adSecs, err := v.sr.ReadSectors(v.partStart+extPos, (eLen+2047)/2048)
 					if err != nil {
 						return err
 					}
-					tagID := binary.LittleEndian.Uint16(adSecs[0:2])
-					if tagID == 328 {
+					contTagID := binary.LittleEndian.Uint16(adSecs[0:2])
+					if contTagID == 328 {
 						adListLen := binary.LittleEndian.Uint32(adSecs[20:24])
 						if 24+int(adListLen) <= len(adSecs) {
 							if err := parseADs(adSecs[24 : 24+int(adListLen)]); err != nil {
@@ -318,12 +337,15 @@ func (v *Volume) parseFileEntry(lba uint32) (*fileEntry, error) {
 							}
 						}
 					}
-				} else if eType == 0 || eType == 1 {
+
+				case 0, 1:
+					// Recorded and allocated, or allocated but not recorded.
 					fe.extents = append(fe.extents, extent{
 						lba: v.partStart + extPos,
 						len: eLen,
 					})
 				}
+				// eType == 2 (not recorded, not allocated) — skip.
 			}
 			return nil
 		}
@@ -433,12 +455,12 @@ func (v *Volume) readDirEntries(fe *fileEntry) ([]*fileEntry, error) {
 		}
 
 		fileChars := data[offset+18]
-		lfi := int(data[offset+19])
-		icbLBA := binary.LittleEndian.Uint32(data[offset+24 : offset+28])
-		liu := int(binary.LittleEndian.Uint16(data[offset+36 : offset+38]))
+		lfi       := int(data[offset+19])
+		icbLBA    := binary.LittleEndian.Uint32(data[offset+24 : offset+28])
+		liu       := int(binary.LittleEndian.Uint16(data[offset+36 : offset+38]))
 
 		isParent := fileChars&0x08 != 0
-		isDir := fileChars&0x02 != 0
+		isDir    := fileChars&0x02 != 0
 
 		nameStart := offset + 38 + liu
 		name := ""
@@ -457,7 +479,7 @@ func (v *Volume) readDirEntries(fe *fileEntry) ([]*fileEntry, error) {
 		if !isParent && name != "" {
 			child, err := v.parseFileEntry(v.partStart + icbLBA)
 			if err == nil {
-				child.name = name
+				child.name  = name
 				child.isDir = isDir
 				entries = append(entries, child)
 			}
@@ -507,12 +529,12 @@ func parseUDFTimestamp(b []byte) time.Time {
 	if len(b) < 12 {
 		return time.Time{}
 	}
-	year := int(binary.LittleEndian.Uint16(b[2:4]))
+	year  := int(binary.LittleEndian.Uint16(b[2:4]))
 	month := time.Month(b[4])
-	day := int(b[5])
-	hour := int(b[6])
-	min := int(b[7])
-	sec := int(b[8])
+	day   := int(b[5])
+	hour  := int(b[6])
+	min   := int(b[7])
+	sec   := int(b[8])
 	tzRaw := int(binary.LittleEndian.Uint16(b[0:2]) & 0x0FFF)
 	if tzRaw&0x800 != 0 {
 		tzRaw -= 0x1000
@@ -524,7 +546,7 @@ func udfPermToFileMode(perm uint32, isDir bool) os.FileMode {
 	other := os.FileMode((perm>>0)&0x04>>2) | os.FileMode((perm>>0)&0x02>>1) | os.FileMode((perm>>0)&0x01)
 	group := os.FileMode((perm>>5)&0x04>>2) | os.FileMode((perm>>5)&0x02>>1) | os.FileMode((perm>>5)&0x01)
 	owner := os.FileMode((perm>>10)&0x04>>2) | os.FileMode((perm>>10)&0x02>>1) | os.FileMode((perm>>10)&0x01)
-	mode := owner<<6 | group<<3 | other
+	mode  := owner<<6 | group<<3 | other
 	if mode == 0 {
 		mode = 0444
 	}
@@ -550,7 +572,7 @@ func (a feAdapter) Sys() any                   { return nil }
 func (a feAdapter) Type() fs.FileMode          { return fs.FileMode(a.e.mode.Type()) }
 func (a feAdapter) Info() (fs.FileInfo, error) { return a, nil }
 
-// --- udfFile: implements fs.File and io.ReaderAt for streaming and random-access reads ---
+// --- udfFile: implements fs.File and io.ReaderAt ---
 
 type udfFile struct {
 	vol  *Volume
@@ -581,9 +603,9 @@ func (f *udfFile) ReadDir(n int) ([]fs.DirEntry, error) {
 	return out, nil
 }
 
-// ReadAt implements io.ReaderAt by mapping logical byte offsets across UDF extents.
-// This allows random-access readers (such as the WIM parser) to work directly
-// against the ISO without spooling the file to a temp file first.
+// ReadAt implements io.ReaderAt by mapping logical byte offsets across UDF
+// extents. This lets random-access readers (e.g. the WIM parser) work directly
+// against the ISO without spooling to a temp file first.
 func (f *udfFile) ReadAt(p []byte, off int64) (int, error) {
 	if off < 0 {
 		return 0, fmt.Errorf("udf: ReadAt: negative offset")
@@ -592,7 +614,7 @@ func (f *udfFile) ReadAt(p []byte, off int64) (int, error) {
 		return 0, io.EOF
 	}
 
-	// Clamp read length to the file boundary.
+	// Clamp read to file boundary.
 	if int64(len(p)) > int64(f.fe.totalLen)-off {
 		p = p[:int64(f.fe.totalLen)-off]
 	}
@@ -607,7 +629,7 @@ func (f *udfFile) ReadAt(p []byte, off int64) (int, error) {
 
 	var (
 		n      int
-		cursor int64 // logical start byte of the current extent
+		cursor int64 // logical byte start of the current extent
 	)
 	for _, ext := range f.fe.extents {
 		if n == len(p) {
@@ -625,9 +647,9 @@ func (f *udfFile) ReadAt(p []byte, off int64) (int, error) {
 			canRead = int64(len(p) - n)
 		}
 		got, err := f.vol.sr.ReadBytes(diskOff, int(canRead))
-		nc := copy(p[n:], got)
-		n   += nc
-		off += int64(nc)
+		nc   := copy(p[n:], got)
+		n    += nc
+		off  += int64(nc)
 		cursor += extLen
 		if err != nil {
 			return n, err

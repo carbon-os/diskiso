@@ -407,7 +407,6 @@ func (v *Volume) readDir(fe *fileEntry) ([]fs.DirEntry, error) {
 
 func (v *Volume) readDirEntries(fe *fileEntry) ([]*fileEntry, error) {
 	var data []byte
-	var err error
 	if fe.inlineData != nil {
 		data = fe.inlineData
 	} else {

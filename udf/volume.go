@@ -211,32 +211,31 @@ type fileEntry struct {
 // at the candidate adStart: if the first AD carries a zero extent length for a
 // non-empty file, the standard EFE offsets are wrong and we fall back to the
 // FE-compatible offsets.
-func resolveADLayout(sec []byte, tagID uint16, infoLen uint64, allocType uint32) (eaLen, adLen uint32, adStart, modOff int) {
+func resolveADLayout(sec []byte, tagID uint16, infoLen uint64, allocType uint32) (adLen uint32, adStart, modOff int) {
 	if tagID != 261 {
-		// Regular File Entry (tag 260).
-		eaLen   = binary.LittleEndian.Uint32(sec[168:172])
-		adLen   = binary.LittleEndian.Uint32(sec[172:176])
-		adStart = 176 + int(eaLen)
-		modOff  = 84
+		eaLen   := binary.LittleEndian.Uint32(sec[168:172])
+		adLen    = binary.LittleEndian.Uint32(sec[172:176])
+		adStart  = 176 + int(eaLen)
+		modOff   = 84
 		return
 	}
 
-	// Extended File Entry (tag 261) — try standard layout first.
-	// Standard: objectSize at BP 64 shifts eaLen to BP 208, modTime to BP 92.
 	efeEALen   := binary.LittleEndian.Uint32(sec[208:212])
 	efeADLen   := binary.LittleEndian.Uint32(sec[212:216])
 	efeADStart := 216 + int(efeEALen)
 
 	if adLayoutValid(sec, efeADStart, efeADLen, allocType, infoLen) {
-		return efeEALen, efeADLen, efeADStart, 92
+		adLen   = efeADLen
+		adStart = efeADStart
+		modOff  = 92
+		return
 	}
 
-	// Standard EFE layout produced no valid ADs — generator used a
-	// FE-compatible body (tag=261 without objectSize).
-	feEALen   := binary.LittleEndian.Uint32(sec[168:172])
-	feADLen   := binary.LittleEndian.Uint32(sec[172:176])
-	feADStart := 176 + int(feEALen)
-	return feEALen, feADLen, feADStart, 84
+	feEALen  := binary.LittleEndian.Uint32(sec[168:172])
+	adLen     = binary.LittleEndian.Uint32(sec[172:176])
+	adStart   = 176 + int(feEALen)
+	modOff    = 84
+	return
 }
 
 // adLayoutValid reports whether adStart/adLen look like a consistent

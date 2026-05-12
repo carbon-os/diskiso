@@ -286,7 +286,7 @@ func (v *Volume) parseFileEntry(lba uint32) (*fileEntry, error) {
 	posixPerm   := binary.LittleEndian.Uint32(sec[44:48])
 	mode        := udfPermToFileMode(posixPerm, isDir)
 
-	eaLen, adLen, adStart, modOff := resolveADLayout(sec, tagID, infoLen, allocType)
+	adLen, adStart, modOff := resolveADLayout(sec, tagID, infoLen, allocType)
 	modTime := parseUDFTimestamp(sec[modOff : modOff+12])
 
 	fe := &fileEntry{

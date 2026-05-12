@@ -249,6 +249,7 @@ func (v *Volume) Readlink(filePath string) (string, error) {
 type fileEntry struct {
 	name       string
 	isDir      bool
+	feLBA      uint32 // First Fix: Added feLBA
 	dataLBA    uint32
 	dataLen    uint32
 	modTime    time.Time
@@ -376,6 +377,7 @@ func (v *Volume) parseFileEntry(lba uint32) (*fileEntry, error) {
 
 	fe := &fileEntry{
 		isDir:   isDir,
+		feLBA:   lba,     // Second Fix: Save the feLBA here
 		modTime: modTime,
 		mode:    mode,
 		dataLen: uint32(infoLen),
@@ -444,7 +446,7 @@ func (v *Volume) lookupFileEntry(p string) (*fileEntry, error) {
 		if i == len(parts)-1 {
 			return found, nil
 		}
-		curLBA = found.dataLBA
+		curLBA = found.feLBA // Third Fix: Jump to the File Entry LBA instead of dataLBA
 	}
 	return nil, os.ErrNotExist
 }

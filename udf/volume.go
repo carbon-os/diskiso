@@ -19,9 +19,9 @@ import (
 // Volume implements diskiso.Volume for UDF (ECMA-167 / OSTA UDF 1.x–2.x).
 type Volume struct {
 	sr         *region.SectorReader
-	partStart  uint32 // first sector of the UDF partition
-	partLen    uint32 // length of partition in sectors
-	rootICBLBA uint32 // absolute LBA of root directory File Entry
+	partStart  uint32
+	partLen    uint32
+	rootICBLBA uint32
 	label      string
 	size       int64
 }
@@ -64,10 +64,10 @@ func (v *Volume) parseVDS(startLBA, length uint32) error {
 		switch tagID {
 		case 5:
 			partStart = binary.LittleEndian.Uint32(sec[188:192])
-			partLen = binary.LittleEndian.Uint32(sec[192:196])
+			partLen   = binary.LittleEndian.Uint32(sec[192:196])
 			partFound = true
 		case 6:
-			fsdLBA = binary.LittleEndian.Uint32(sec[252:256])
+			fsdLBA  = binary.LittleEndian.Uint32(sec[252:256])
 			fsdFound = true
 		case 8:
 			goto done
@@ -79,8 +79,8 @@ done:
 	}
 
 	v.partStart = partStart
-	v.partLen = partLen
-	v.size = int64(partStart+partLen) * region.SectorSize
+	v.partLen   = partLen
+	v.size      = int64(partStart+partLen) * region.SectorSize
 
 	return v.parseFSD(v.partStart + fsdLBA)
 }
@@ -97,7 +97,7 @@ func (v *Volume) parseFSD(lba uint32) error {
 
 	v.rootICBLBA = v.partStart + binary.LittleEndian.Uint32(sec[404:408])
 
-	field := sec[112:240]
+	field  := sec[112:240]
 	strLen := int(field[127])
 	if strLen > 0 && strLen <= 127 {
 		v.label = decodeCS0(field[:strLen])
@@ -196,26 +196,78 @@ type fileEntry struct {
 	inlineData []byte
 }
 
-// parseFileEntry reads and decodes the File Entry or Extended File Entry at the
-// given absolute sector LBA.
+// resolveADLayout returns the eaLen, adLen, adStart, and modificationTime byte
+// offset appropriate for this file entry sector.
 //
-// ECMA-167 3rd edition defines two ICB file-entry descriptors:
+// Tag 260 (File Entry) has fixed offsets per ECMA-167:
+//   eaLen@168  adLen@172  adBase=176  modTime@84
 //
-//	tag 260 — File Entry (FE)
-//	  BP 168  lengthExtendedAttr  (4)
-//	  BP 172  lengthAllocDescs    (4)
-//	  BP 176  allocationDescriptors…
+// Tag 261 (Extended File Entry) adds objectSize (8 bytes) at BP 64, which
+// shifts eaLen to BP 208 and modTime to BP 92.  However, some UDF generators
+// emit tag=261 descriptors whose body is byte-for-byte identical to a tag=260
+// FE — no objectSize, no streamDirectoryICB — so eaLen is still at BP 168.
 //
-//	tag 261 — Extended File Entry (EFE)
-//	  Adds objectSize (8), createTime (12), reserved (4), and
-//	  streamDirectoryICB (16) relative to the FE layout, pushing the
-//	  allocation-descriptor fields to:
-//	  BP 208  lengthExtendedAttr  (4)
-//	  BP 212  lengthAllocDescs    (4)
-//	  BP 216  allocationDescriptors…
+// We distinguish the two EFE variants by validating the allocation descriptors
+// at the candidate adStart: if the first AD carries a zero extent length for a
+// non-empty file, the standard EFE offsets are wrong and we fall back to the
+// FE-compatible offsets.
+func resolveADLayout(sec []byte, tagID uint16, infoLen uint64, allocType uint32) (eaLen, adLen uint32, adStart, modOff int) {
+	if tagID != 261 {
+		// Regular File Entry (tag 260).
+		eaLen   = binary.LittleEndian.Uint32(sec[168:172])
+		adLen   = binary.LittleEndian.Uint32(sec[172:176])
+		adStart = 176 + int(eaLen)
+		modOff  = 84
+		return
+	}
+
+	// Extended File Entry (tag 261) — try standard layout first.
+	// Standard: objectSize at BP 64 shifts eaLen to BP 208, modTime to BP 92.
+	efeEALen   := binary.LittleEndian.Uint32(sec[208:212])
+	efeADLen   := binary.LittleEndian.Uint32(sec[212:216])
+	efeADStart := 216 + int(efeEALen)
+
+	if adLayoutValid(sec, efeADStart, efeADLen, allocType, infoLen) {
+		return efeEALen, efeADLen, efeADStart, 92
+	}
+
+	// Standard EFE layout produced no valid ADs — generator used a
+	// FE-compatible body (tag=261 without objectSize).
+	feEALen   := binary.LittleEndian.Uint32(sec[168:172])
+	feADLen   := binary.LittleEndian.Uint32(sec[172:176])
+	feADStart := 176 + int(feEALen)
+	return feEALen, feADLen, feADStart, 84
+}
+
+// adLayoutValid reports whether adStart/adLen look like a consistent
+// allocation-descriptor region for a file with the given infoLen.
 //
-// modificationTime is at BP 84 for FE and BP 92 for EFE (objectSize shifts
-// logicalBlocksRecorded and the timestamp chain by 8 bytes).
+//   - The AD region must fit entirely within the sector.
+//   - Inline data (allocType 3): adLen must equal infoLen exactly.
+//   - Empty file: any layout is trivially valid.
+//   - Non-empty non-inline: adLen must be non-zero and the first AD must
+//     carry a non-zero extent length (top 2 bits are the type, bottom 30
+//     are the length).
+func adLayoutValid(sec []byte, adStart int, adLen uint32, allocType uint32, infoLen uint64) bool {
+	if adStart < 0 || adStart+int(adLen) > len(sec) {
+		return false
+	}
+	if allocType == 3 {
+		return uint64(adLen) == infoLen
+	}
+	if infoLen == 0 {
+		return true
+	}
+	if adLen == 0 {
+		return false
+	}
+	if adStart+4 > len(sec) {
+		return false
+	}
+	extLen := binary.LittleEndian.Uint32(sec[adStart:adStart+4]) & 0x3FFFFFFF
+	return extLen > 0
+}
+
 func (v *Volume) parseFileEntry(lba uint32) (*fileEntry, error) {
 	sec, err := v.sr.ReadSector(lba)
 	if err != nil {
@@ -231,34 +283,12 @@ func (v *Volume) parseFileEntry(lba uint32) (*fileEntry, error) {
 	isDir       := icbFileType == 4
 	infoLen     := binary.LittleEndian.Uint64(sec[56:64])
 	icbFlags    := binary.LittleEndian.Uint16(sec[34:36])
-	allocType   := icbFlags & 0x0007
+	allocType   := uint32(icbFlags & 0x0007)
 	posixPerm   := binary.LittleEndian.Uint32(sec[44:48])
 	mode        := udfPermToFileMode(posixPerm, isDir)
 
-	// modificationTime — BP 84 for FE, BP 92 for EFE.
-	// EFE inserts an 8-byte objectSize field at BP 64, shifting every
-	// subsequent timestamp by 8 bytes.
-	var modOff int
-	if tagID == 261 {
-		modOff = 92
-	} else {
-		modOff = 84
-	}
+	eaLen, adLen, adStart, modOff := resolveADLayout(sec, tagID, infoLen, allocType)
 	modTime := parseUDFTimestamp(sec[modOff : modOff+12])
-
-	// Allocation-descriptor field offsets.
-	// FE:  eaLen@168  adLen@172  adBase=176
-	// EFE: eaLen@208  adLen@212  adBase=216
-	var eaLenOff, adLenOff, adBase int
-	if tagID == 261 {
-		eaLenOff, adLenOff, adBase = 208, 212, 216
-	} else {
-		eaLenOff, adLenOff, adBase = 168, 172, 176
-	}
-
-	eaLen   := binary.LittleEndian.Uint32(sec[eaLenOff : eaLenOff+4])
-	adLen   := binary.LittleEndian.Uint32(sec[adLenOff : adLenOff+4])
-	adStart := adBase + int(eaLen)
 
 	fe := &fileEntry{
 		isDir:    isDir,
@@ -269,94 +299,91 @@ func (v *Volume) parseFileEntry(lba uint32) (*fileEntry, error) {
 	}
 
 	if allocType == 3 {
-		// Inline data stored directly in the allocation-descriptor area.
+		// Inline data — stored directly in the allocation-descriptor area.
 		if adLen > 0 && adStart+int(adLen) <= len(sec) {
 			fe.inlineData = make([]byte, adLen)
 			copy(fe.inlineData, sec[adStart:adStart+int(adLen)])
 		}
-	} else {
-		var parseADs func(adData []byte) error
-		parseADs = func(adData []byte) error {
-			offset := 0
-			for offset < len(adData) {
-				var extLen, extPos uint32
-				var step int
-
-				switch allocType {
-				case 0: // Short AD: extLength(4) + extPosition(4)
-					if offset+8 > len(adData) {
-						return nil
-					}
-					extLen = binary.LittleEndian.Uint32(adData[offset : offset+4])
-					extPos = binary.LittleEndian.Uint32(adData[offset+4 : offset+8])
-					step = 8
-
-				case 1: // Long AD: extLength(4) + lb_addr{ logicalBlockNum(4) + partRef(2) }(6) + impUse(6)
-					if offset+16 > len(adData) {
-						return nil
-					}
-					extLen = binary.LittleEndian.Uint32(adData[offset : offset+4])
-					extPos = binary.LittleEndian.Uint32(adData[offset+4 : offset+8])
-					// partitionReferenceNum at [offset+8:offset+10] — ignored (single-partition)
-					step = 16
-
-				case 2: // Extended AD: extLength(4) + recordedLength(4) + infoLength(4) + lb_addr(6) + impUse(2)
-					if offset+20 > len(adData) {
-						return nil
-					}
-					extLen = binary.LittleEndian.Uint32(adData[offset : offset+4])
-					extPos = binary.LittleEndian.Uint32(adData[offset+12 : offset+16])
-					step = 20
-
-				default:
-					return fmt.Errorf("udf: unsupported allocType %d", allocType)
-				}
-
-				eType := extLen >> 30
-				eLen  := extLen & 0x3FFFFFFF
-				offset += step
-
-				if eLen == 0 {
-					continue
-				}
-
-				switch eType {
-				case 3:
-					// Allocation Extent Descriptor — continuation sector.
-					// ECMA-167 4/14.5: tag(16) + prevAllocExtLoc(4) + lengthOfADs(4) + ADs…
-					adSecs, err := v.sr.ReadSectors(v.partStart+extPos, (eLen+2047)/2048)
-					if err != nil {
-						return err
-					}
-					contTagID := binary.LittleEndian.Uint16(adSecs[0:2])
-					if contTagID == 328 {
-						adListLen := binary.LittleEndian.Uint32(adSecs[20:24])
-						if 24+int(adListLen) <= len(adSecs) {
-							if err := parseADs(adSecs[24 : 24+int(adListLen)]); err != nil {
-								return err
-							}
-						}
-					}
-
-				case 0, 1:
-					// Recorded and allocated, or allocated but not recorded.
-					fe.extents = append(fe.extents, extent{
-						lba: v.partStart + extPos,
-						len: eLen,
-					})
-				}
-				// eType == 2 (not recorded, not allocated) — skip.
-			}
-			return nil
-		}
-
-		if adLen > 0 && adStart+int(adLen) <= len(sec) {
-			if err := parseADs(sec[adStart : adStart+int(adLen)]); err != nil {
-				return nil, err
-			}
-		}
+		return fe, nil
 	}
 
+	var parseADs func(adData []byte) error
+	parseADs = func(adData []byte) error {
+		offset := 0
+		for offset < len(adData) {
+			var extLen, extPos uint32
+			var step int
+
+			switch allocType {
+			case 0: // Short AD: extLength(4) + extPosition(4)
+				if offset+8 > len(adData) {
+					return nil
+				}
+				extLen = binary.LittleEndian.Uint32(adData[offset : offset+4])
+				extPos = binary.LittleEndian.Uint32(adData[offset+4 : offset+8])
+				step = 8
+
+			case 1: // Long AD: extLength(4) + lb_addr{ LBN(4) + partRef(2) }(6) + impUse(6)
+				if offset+16 > len(adData) {
+					return nil
+				}
+				extLen = binary.LittleEndian.Uint32(adData[offset : offset+4])
+				extPos = binary.LittleEndian.Uint32(adData[offset+4 : offset+8])
+				step = 16
+
+			case 2: // Extended AD: extLength(4) + recordedLen(4) + infoLen(4) + lb_addr(6) + impUse(2)
+				if offset+20 > len(adData) {
+					return nil
+				}
+				extLen = binary.LittleEndian.Uint32(adData[offset : offset+4])
+				extPos = binary.LittleEndian.Uint32(adData[offset+12 : offset+16])
+				step = 20
+
+			default:
+				return fmt.Errorf("udf: unsupported allocType %d", allocType)
+			}
+
+			eType := extLen >> 30
+			eLen  := extLen & 0x3FFFFFFF
+			offset += step
+
+			if eLen == 0 {
+				continue
+			}
+
+			switch eType {
+			case 3:
+				// Allocation Extent Descriptor (tag 328) — continuation sector.
+				// ECMA-167 4/14.5: tag(16) + prevAllocExtLoc(4) + lengthOfADs(4) + ADs…
+				adSecs, err := v.sr.ReadSectors(v.partStart+extPos, (eLen+2047)/2048)
+				if err != nil {
+					return err
+				}
+				if binary.LittleEndian.Uint16(adSecs[0:2]) == 328 {
+					adListLen := binary.LittleEndian.Uint32(adSecs[20:24])
+					if 24+int(adListLen) <= len(adSecs) {
+						if err := parseADs(adSecs[24 : 24+int(adListLen)]); err != nil {
+							return err
+						}
+					}
+				}
+
+			case 0, 1:
+				fe.extents = append(fe.extents, extent{
+					lba: v.partStart + extPos,
+					len: eLen,
+				})
+				// eType 2 (allocated, not recorded) — skip.
+			}
+		}
+		return nil
+	}
+
+	if adLen > 0 && adStart+int(adLen) <= len(sec) {
+		if err := parseADs(sec[adStart : adStart+int(adLen)]); err != nil {
+			return nil, err
+		}
+	}
 	return fe, nil
 }
 
@@ -371,7 +398,7 @@ func (v *Volume) lookupFileEntry(p string) (*fileEntry, error) {
 		return fe, nil
 	}
 
-	parts := strings.Split(strings.TrimPrefix(p, "/"), "/")
+	parts  := strings.Split(strings.TrimPrefix(p, "/"), "/")
 	curLBA := v.rootICBLBA
 
 	for i, part := range parts {
@@ -507,7 +534,7 @@ func decodeCS0(b []byte) string {
 		return ""
 	}
 	compressionID := b[0]
-	content := b[1:]
+	content       := b[1:]
 	switch compressionID {
 	case 8:
 		return string(content)
@@ -604,8 +631,8 @@ func (f *udfFile) ReadDir(n int) ([]fs.DirEntry, error) {
 }
 
 // ReadAt implements io.ReaderAt by mapping logical byte offsets across UDF
-// extents. This lets random-access readers (e.g. the WIM parser) work directly
-// against the ISO without spooling to a temp file first.
+// extents, allowing random-access readers (e.g. the WIM parser) to work
+// directly against the ISO without spooling to a temporary file.
 func (f *udfFile) ReadAt(p []byte, off int64) (int, error) {
 	if off < 0 {
 		return 0, fmt.Errorf("udf: ReadAt: negative offset")
@@ -629,7 +656,7 @@ func (f *udfFile) ReadAt(p []byte, off int64) (int, error) {
 
 	var (
 		n      int
-		cursor int64 // logical byte start of the current extent
+		cursor int64
 	)
 	for _, ext := range f.fe.extents {
 		if n == len(p) {
@@ -647,9 +674,9 @@ func (f *udfFile) ReadAt(p []byte, off int64) (int, error) {
 			canRead = int64(len(p) - n)
 		}
 		got, err := f.vol.sr.ReadBytes(diskOff, int(canRead))
-		nc   := copy(p[n:], got)
-		n    += nc
-		off  += int64(nc)
+		nc     := copy(p[n:], got)
+		n      += nc
+		off    += int64(nc)
 		cursor += extLen
 		if err != nil {
 			return n, err
